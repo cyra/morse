@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""Real-time CSI viewer — runs on your Mac, streams from Pi via SSH.
+"""Real-time CSI viewer — runs on your Mac, streams from Pi.
 
 Usage:
-    python3 csi_realtime_viewer.py [pi-address]
+    python3 csi_realtime_viewer.py [pi-address] [--ssh]
 
     Default Pi address: 192.168.1.237
-    Requires: pip install matplotlib numpy scipy
-
-The script SSHs into the Pi, runs tcpdump to capture Nexmon CSI
-packets, and plots them live with matplotlib.
+    By default connects to csi_server.py on port 5555.
+    Pass --ssh to use the legacy SSH+tcpdump pipe instead.
+    Requires: pip install matplotlib numpy
 
 Panels:
   1. Subcarrier amplitudes (bar chart)
@@ -17,14 +16,19 @@ Panels:
   4. Motion energy + presence indicator
 """
 
+import json
+import socket
 import subprocess
 import struct
 import sys
+import threading
 import time
 import numpy as np
 
-PI_HOST = sys.argv[1] if len(sys.argv) > 1 else "192.168.1.237"
+PI_HOST = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else "192.168.1.237"
 PI_USER = "jonas"
+PI_PORT = 5555
+USE_SSH = "--ssh" in sys.argv
 INTERFACE = "wlan0"
 NEXMON_HEADER_SIZE = 18
 
@@ -121,22 +125,68 @@ def main():
     from matplotlib.gridspec import GridSpec
     import matplotlib.colors as mcolors
 
-    print(f"Connecting to {PI_USER}@{PI_HOST}...")
-    proc = subprocess.Popen(
-        [
-            "ssh", "-o", "StrictHostKeyChecking=no",
-            f"{PI_USER}@{PI_HOST}",
-            f"sudo tcpdump -i {INTERFACE} -U -w - dst port 5500",
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    )
+    # Data source — either TCP server or SSH pipe
+    proc = None
+    tcp_sock = None
+    tcp_buf = b""
+    packet_queue = []
+    queue_lock = threading.Lock()
 
-    hdr = read_exactly(proc.stdout, PCAP_GLOBAL_HDR)
-    if hdr is None:
-        print("ERROR: Could not start capture. Is CSI active on the Pi?")
-        sys.exit(1)
-    print("Connected! Receiving CSI packets...")
+    if USE_SSH:
+        print(f"Connecting via SSH to {PI_USER}@{PI_HOST}...")
+        proc = subprocess.Popen(
+            [
+                "ssh", "-o", "StrictHostKeyChecking=no",
+                f"{PI_USER}@{PI_HOST}",
+                f"sudo tcpdump -i {INTERFACE} -U -w - dst port 5500",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+
+        hdr = read_exactly(proc.stdout, PCAP_GLOBAL_HDR)
+        if hdr is None:
+            print("ERROR: Could not start capture. Is CSI active on the Pi?")
+            sys.exit(1)
+        print("Connected via SSH!")
+    else:
+        print(f"Connecting to CSI server at {PI_HOST}:{PI_PORT}...")
+        tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            tcp_sock.connect((PI_HOST, PI_PORT))
+        except ConnectionRefusedError:
+            print(f"ERROR: Cannot connect to {PI_HOST}:{PI_PORT}")
+            print(f"Start the server on the Pi: sudo python3 -u csi_server.py")
+            print(f"Or use --ssh mode: python3 csi_realtime_viewer.py {PI_HOST} --ssh")
+            sys.exit(1)
+        tcp_sock.setblocking(False)
+        print("Connected to CSI server!")
+
+        def tcp_reader():
+            nonlocal tcp_buf
+            sock = tcp_sock
+            while True:
+                try:
+                    chunk = sock.recv(65536)
+                except BlockingIOError:
+                    time.sleep(0.005)
+                    continue
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                tcp_buf += chunk
+                while b"\n" in tcp_buf:
+                    line, tcp_buf = tcp_buf.split(b"\n", 1)
+                    try:
+                        msg = json.loads(line)
+                        with queue_lock:
+                            packet_queue.append(msg)
+                    except json.JSONDecodeError:
+                        continue
+
+        reader_thread = threading.Thread(target=tcp_reader, daemon=True)
+        reader_thread.start()
 
     # State
     n_sub = [0]
@@ -172,49 +222,31 @@ def main():
     presence_text = fig.text(0.95, 0.99, "", ha="right", va="top",
                               fontsize=14, family="monospace", weight="bold")
 
-    def read_packets():
-        count = 0
-        while count < 20:
-            pkt_hdr = read_exactly(proc.stdout, PCAP_PKT_HDR)
-            if pkt_hdr is None:
-                return False
-            _, _, incl_len, _ = struct.unpack("<IIII", pkt_hdr)
-            pkt_data = read_exactly(proc.stdout, incl_len)
-            if pkt_data is None:
-                return False
-            if incl_len < FRAME_OVERHEAD + NEXMON_HEADER_SIZE:
-                continue
-            payload = pkt_data[FRAME_OVERHEAD:]
-            result = parse_csi(payload)
-            if result is None:
-                continue
+    def ingest_packet(rssi, mac, amplitudes, motion=None):
+        nonlocal amp_history
+        rssi_val[0] = rssi
+        mac_val[0] = mac
+        current_amp[0] = amplitudes
+        pkt_count[0] += 1
 
-            rssi, mac, amplitudes = result
-            rssi_val[0] = rssi
-            mac_val[0] = mac
-            current_amp[0] = amplitudes
-            pkt_count[0] += 1
+        ns = len(amplitudes)
+        if ns != n_sub[0]:
+            n_sub[0] = ns
+            amp_history = np.zeros((HISTORY_LEN, ns))
 
-            ns = len(amplitudes)
-            if ns != n_sub[0]:
-                n_sub[0] = ns
-                nonlocal amp_history
-                amp_history = np.zeros((HISTORY_LEN, ns))
+        amp_history[:-1] = amp_history[1:]
+        amp_history[-1] = amplitudes
 
-            amp_history[:-1] = amp_history[1:]
-            amp_history[-1] = amplitudes
+        mean_history[:-1] = mean_history[1:]
+        mean_history[-1] = np.mean(amplitudes)
 
-            mean_history[:-1] = mean_history[1:]
-            mean_history[-1] = np.mean(amplitudes)
+        win = min(10, pkt_count[0])
+        if win > 1:
+            recent = mean_history[-win:]
+            variance_history[-1] = np.var(recent)
+        variance_history[:-1] = variance_history[1:]
 
-            # Sliding window variance (motion sensitivity)
-            win = min(10, pkt_count[0])
-            if win > 1:
-                recent = mean_history[-win:]
-                variance_history[-1] = np.var(recent)
-            variance_history[:-1] = variance_history[1:]
-
-            # Motion via correlation
+        if motion is None:
             v = amplitudes / (np.max(amplitudes) + 1e-9)
             motion = 0.0
             if prev_csi[0] is not None and len(v) == len(prev_csi[0]):
@@ -222,11 +254,40 @@ def main():
                 motion = -10 * corr ** 2 + 10
             prev_csi[0] = v
 
-            motion_history[:-1] = motion_history[1:]
-            motion_history[-1] = motion
+        motion_history[:-1] = motion_history[1:]
+        motion_history[-1] = motion
 
-            count += 1
-        return True
+    def read_packets():
+        if USE_SSH:
+            count = 0
+            while count < 20:
+                pkt_hdr = read_exactly(proc.stdout, PCAP_PKT_HDR)
+                if pkt_hdr is None:
+                    return False
+                _, _, incl_len, _ = struct.unpack("<IIII", pkt_hdr)
+                pkt_data = read_exactly(proc.stdout, incl_len)
+                if pkt_data is None:
+                    return False
+                if incl_len < FRAME_OVERHEAD + NEXMON_HEADER_SIZE:
+                    continue
+                payload = pkt_data[FRAME_OVERHEAD:]
+                result = parse_csi(payload)
+                if result is None:
+                    continue
+                rssi, mac, amplitudes = result
+                ingest_packet(rssi, mac, amplitudes)
+                count += 1
+            return True
+        else:
+            with queue_lock:
+                batch = packet_queue[:20]
+                del packet_queue[:20]
+            if not batch:
+                return True
+            for msg in batch:
+                amplitudes = np.array(msg["amplitudes"], dtype=np.float32)
+                ingest_packet(msg["rssi"], msg["mac"], amplitudes, msg.get("motion"))
+            return True
 
     def update(frame_num):
         if not read_packets():
@@ -334,8 +395,11 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        proc.terminate()
-        proc.wait()
+        if proc:
+            proc.terminate()
+            proc.wait()
+        if tcp_sock:
+            tcp_sock.close()
 
 
 if __name__ == "__main__":
