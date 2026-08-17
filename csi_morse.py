@@ -5,14 +5,16 @@ Uses Nexmon CSI on a Raspberry Pi 4B to detect hand blockages
 in the WiFi signal path and decode them as Morse code.
 Requires sudo.
 
-CSI parsing adapted from github.com/jakka351/WIFI-CSI-Motion-Detection
+Cover the Pi's antenna area with your hand to block the signal.
+Short block = dot, long block = dash, pause = letter gap.
+
+Usage: sudo python3 -u csi_morse.py
 """
 
 import subprocess
 import struct
 import time
 import sys
-import os
 import numpy as np
 
 MORSE_TO_CHAR = {
@@ -24,21 +26,26 @@ MORSE_TO_CHAR = {
     "--..": "Z", ".----": "1", "..---": "2", "...--": "3",
     "....-": "4", ".....": "5", "-....": "6", "--...": "7",
     "---..": "8", "----.": "9", "-----": "0",
+    ".-.-.-": ".", "--..--": ",", "..--..": "?",
 }
 
 DOT_MAX = 0.3
-DASH_MAX = 0.8
-LETTER_GAP = 0.8
-
-AMPLITUDE_DROP_FACTOR = 0.7
-EMA_ALPHA = 0.01
+DASH_MAX = 1.0
+LETTER_GAP = 1.0
+WORD_GAP = 2.0
 MIN_BLOCKAGE_DURATION = 0.05
+
+BLOCK_THRESHOLD = 0.65
+UNBLOCK_THRESHOLD = 0.80
+BASELINE_EMA = 0.01
+SIGNAL_EMA = 0.4
+TOP_N_SUBCARRIERS = 20
+CALIBRATION_PACKETS = 50
 
 INTERFACE = "wlan0"
 NEXMON_HEADER_SIZE = 18
 MAKECSIPARAMS = "/home/jonas/nexmon/patches/bcm43455c0/7_45_189/nexmon_csi/utils/makecsiparams/makecsiparams"
 
-# Subcarrier mask for 256 subcarriers (80MHz)
 fx256 = np.ones(256, dtype=bool)
 fx256[:6] = False
 fx256[64 * 4 - 5:] = False
@@ -58,7 +65,6 @@ FRAME_OVERHEAD = ETH_HDR + IP_HDR + UDP_HDR
 
 
 def ensure_csi_active():
-    """Ensure Nexmon CSI is configured and monitor mode is on."""
     result = subprocess.run(
         ["nexutil", f"-I{INTERFACE}", "-m"],
         capture_output=True, text=True, timeout=5,
@@ -68,18 +74,13 @@ def ensure_csi_active():
         return True
 
     print("Configuring CSI...", flush=True)
-
-    # Unmanage from NetworkManager
     subprocess.run(["nmcli", "dev", "disconnect", INTERFACE],
                     check=False, capture_output=True, timeout=5)
     subprocess.run(["nmcli", "dev", "set", INTERFACE, "managed", "no"],
                     check=False, capture_output=True, timeout=5)
-
     subprocess.run(["ifconfig", INTERFACE, "up"],
                     check=False, capture_output=True, timeout=5)
     subprocess.run(["iw", "dev", INTERFACE, "set", "power_save", "off"],
-                    check=False, capture_output=True, timeout=5)
-    subprocess.run(["nexutil", "-s86", "-i", "-v0"],
                     check=False, capture_output=True, timeout=5)
 
     params = subprocess.run(
@@ -117,10 +118,9 @@ def read_exactly(stream, n):
     return buf
 
 
-def parse_csi_payload(payload: bytes) -> np.ndarray | None:
+def parse_csi_payload(payload):
     if len(payload) < NEXMON_HEADER_SIZE + 4:
         return None
-
     magic = struct.unpack(">H", payload[:2])[0]
     if magic != 0x1111:
         return None
@@ -134,26 +134,16 @@ def parse_csi_payload(payload: bytes) -> np.ndarray | None:
     ).astype(np.float32).view(np.complex64)
 
     n_complex = len(data)
-
     if n_complex == 256:
         pl = data[fx256]
-        x = pl.reshape((4, -1))
-        mn = np.mean(np.abs(x), axis=-1)
-        msk = np.zeros(mn.shape, dtype=bool)
-        msk[np.argmax(mn)] = True
-        pl = x[msk].ravel()
     else:
-        skip = max(2, n_complex // 20)
+        skip = max(1, n_complex // 20)
         pl = data[skip:-skip] if n_complex > skip * 2 else data
 
-    return pl
+    return np.abs(pl)
 
 
-def compute_amplitude(csi: np.ndarray) -> float:
-    return float(np.mean(np.abs(csi)))
-
-
-def decode_morse(symbols: str) -> str:
+def decode_morse(symbols):
     return MORSE_TO_CHAR.get(symbols, "?")
 
 
@@ -164,7 +154,9 @@ def main():
 
     ensure_csi_active()
 
-    print(f"Dot: <{DOT_MAX}s  Dash: {DOT_MAX}-{DASH_MAX}s  Letter gap: >{LETTER_GAP}s")
+    print(f"Timing:  dot <{DOT_MAX}s | dash {DOT_MAX}-{DASH_MAX}s | letter gap >{LETTER_GAP}s | word gap >{WORD_GAP}s")
+    print(f"Thresholds:  block <{BLOCK_THRESHOLD:.0%} | unblock >{UNBLOCK_THRESHOLD:.0%} of baseline")
+    print(f"Using top {TOP_N_SUBCARRIERS} subcarriers by signal strength")
     print(flush=True)
 
     proc = subprocess.Popen(
@@ -178,16 +170,21 @@ def main():
         print("ERROR: Failed to start tcpdump.", flush=True)
         sys.exit(1)
 
+    # Calibration state
+    cal_samples = []
+    best_subs = None
     baseline = None
+    smoothed = None
+
+    # Detection state
     blocked = False
     block_start = 0.0
     last_unblock_time = time.time()
     symbol_buffer = ""
+    decoded_text = ""
     packet_count = 0
-    calibration_amplitudes = []
-    CALIBRATION_PACKETS = 50
 
-    print("Calibrating baseline... keep hands clear of the signal path.", flush=True)
+    print(f"Calibrating baseline ({CALIBRATION_PACKETS} packets)... keep hands clear.", flush=True)
 
     try:
         while True:
@@ -196,79 +193,110 @@ def main():
                 print("\nCapture ended.", flush=True)
                 break
 
-            ts_sec, ts_usec, incl_len, orig_len = struct.unpack("<IIII", pkt_hdr)
-
+            _, _, incl_len, _ = struct.unpack("<IIII", pkt_hdr)
             pkt_data = read_exactly(proc.stdout, incl_len)
             if pkt_data is None:
                 break
-
             if incl_len < FRAME_OVERHEAD:
                 continue
-            payload = pkt_data[FRAME_OVERHEAD:]
 
-            csi = parse_csi_payload(payload)
-            if csi is None:
+            payload = pkt_data[FRAME_OVERHEAD:]
+            amplitudes = parse_csi_payload(payload)
+            if amplitudes is None:
                 continue
 
-            amplitude = compute_amplitude(csi)
             packet_count += 1
 
-            if len(calibration_amplitudes) < CALIBRATION_PACKETS:
-                calibration_amplitudes.append(amplitude)
-                if len(calibration_amplitudes) == CALIBRATION_PACKETS:
-                    baseline = np.mean(calibration_amplitudes)
-                    print(f"Baseline amplitude: {baseline:.1f}", flush=True)
-                    print("Ready! Block the signal path to input Morse code.", flush=True)
+            # --- Calibration phase ---
+            if len(cal_samples) < CALIBRATION_PACKETS:
+                cal_samples.append(amplitudes)
+                if len(cal_samples) == CALIBRATION_PACKETS:
+                    stacked = np.array(cal_samples)
+                    mean_per_sub = np.mean(stacked, axis=0)
+                    best_subs = np.argsort(mean_per_sub)[-TOP_N_SUBCARRIERS:]
+                    baseline = float(np.mean(mean_per_sub[best_subs]))
+                    smoothed = baseline
+                    print(f"Baseline: {baseline:.1f} (selected {len(best_subs)} subcarriers)", flush=True)
+                    print("Ready! Cover the Pi to input Morse code.", flush=True)
                     print("-" * 50, flush=True)
                 continue
 
-            if not blocked:
-                baseline = (1 - EMA_ALPHA) * baseline + EMA_ALPHA * amplitude
+            # --- Use selected subcarriers ---
+            amp = float(np.mean(amplitudes[best_subs]))
+            smoothed = SIGNAL_EMA * amp + (1 - SIGNAL_EMA) * smoothed
 
-            threshold = baseline * AMPLITUDE_DROP_FACTOR
             now = time.time()
 
-            if amplitude < threshold and not blocked:
-                blocked = True
-                block_start = now
+            # --- Hysteresis block detection ---
+            if not blocked:
+                baseline = (1 - BASELINE_EMA) * baseline + BASELINE_EMA * smoothed
 
-            elif amplitude >= threshold and blocked:
-                blocked = False
-                duration = now - block_start
-                last_unblock_time = now
+                if smoothed < baseline * BLOCK_THRESHOLD:
+                    blocked = True
+                    block_start = now
 
-                if duration < MIN_BLOCKAGE_DURATION:
-                    pass
-                elif duration < DOT_MAX:
-                    symbol_buffer += "."
-                    sys.stderr.write(".")
-                    sys.stderr.flush()
-                elif duration < DASH_MAX:
-                    symbol_buffer += "-"
-                    sys.stderr.write("-")
-                    sys.stderr.flush()
-                else:
-                    if symbol_buffer:
-                        letter = decode_morse(symbol_buffer)
-                        print(letter, end="", flush=True)
-                        symbol_buffer = ""
-                    sys.stderr.write("|")
-                    sys.stderr.flush()
+            else:
+                if smoothed > baseline * UNBLOCK_THRESHOLD:
+                    blocked = False
+                    duration = now - block_start
+                    last_unblock_time = now
 
+                    if duration < MIN_BLOCKAGE_DURATION:
+                        pass
+                    elif duration < DOT_MAX:
+                        symbol_buffer += "."
+                        sys.stderr.write("·")
+                        sys.stderr.flush()
+                    elif duration < DASH_MAX:
+                        symbol_buffer += "-"
+                        sys.stderr.write("—")
+                        sys.stderr.flush()
+                    else:
+                        if symbol_buffer:
+                            letter = decode_morse(symbol_buffer)
+                            decoded_text += letter
+                            print(letter, end="", flush=True)
+                            symbol_buffer = ""
+                        sys.stderr.write("|")
+                        sys.stderr.flush()
+
+            # --- Letter/word gap detection ---
             if not blocked and symbol_buffer:
                 gap = now - last_unblock_time
                 if gap > LETTER_GAP:
                     letter = decode_morse(symbol_buffer)
+                    decoded_text += letter
                     print(letter, end="", flush=True)
                     symbol_buffer = ""
+
+            if not blocked and decoded_text and not symbol_buffer:
+                gap = now - last_unblock_time
+                if gap > WORD_GAP and not decoded_text.endswith(" "):
+                    decoded_text += " "
+                    print(" ", end="", flush=True)
+
+            # --- Live status on stderr ---
+            if packet_count % 20 == 0:
+                ratio = smoothed / baseline if baseline else 0
+                state = "BLOCKED" if blocked else "open"
+                bar_len = 30
+                bar_fill = int(min(ratio, 1.2) / 1.2 * bar_len)
+                bar = "█" * bar_fill + "░" * (bar_len - bar_fill)
+                thresh_pos = int(BLOCK_THRESHOLD / 1.2 * bar_len)
+                sys.stderr.write(
+                    f"\r  [{bar}] {ratio:.0%} {state:>7}  "
+                    f"buf:{''.join(symbol_buffer[-6:]): <6}"
+                )
+                sys.stderr.flush()
 
     except KeyboardInterrupt:
         if symbol_buffer:
             letter = decode_morse(symbol_buffer)
+            decoded_text += letter
             print(letter, end="", flush=True)
         print()
-        print(f"\nTotal CSI packets processed: {packet_count}")
-        print("Goodbye!")
+        print(f"\nDecoded: {decoded_text}")
+        print(f"Packets: {packet_count}")
     finally:
         proc.terminate()
         proc.wait()
